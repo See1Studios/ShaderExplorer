@@ -1,0 +1,112 @@
+// Inputs: UV, BaseAspect, SpeedStretch, MasterSpeed, MasterSize, Variation, NumInstances, Smoothness, ClusterWidth, TimeOffset
+
+struct SDFHelper
+{
+    // Integer-based hash - sin 제거
+    static float hash(uint n) {
+        n = (n << 13u) ^ n;
+        n = n * (n * n * 15731u + 789221u) + 1376312589u;
+        return float(n & 0x7fffffffu) / float(0x7fffffff);
+    }
+
+    static float smin(float a, float b, float k, out float h) {
+        h = saturate(0.5 + 0.5 * (b - a) / k);
+        return lerp(b, a, h) - k * h * (1.0 - h);
+    }
+};
+
+float2 p = UV - 0.5;
+int num_instances = clamp(int(NumInstances), 0, 100);
+
+// Early exit
+if(num_instances <= 0) {
+    return float4(0, 0, 1, 0);
+}
+
+// --- 루프 밖 pre-compute (uniform 기반) ---
+float minMult = 1.0 - Variation;
+float maxMult = 1.0 + Variation;
+float halfCluster = ClusterWidth * 0.5;
+float repeatSize = max(0.001, ClusterWidth * 2.0);
+float halfRepeat = repeatSize * 0.5;
+float invRepeat = 1.0 / repeatSize;
+float smoothHalf = Smoothness * 0.5;
+float smoothnessK = max(0.001, Smoothness);
+float gameTime = View.GameTime;
+float speedThreshold = 0.1;
+float invSpeedStretch = 1.0 / max(0.001, SpeedStretch);
+
+// Aspect - 루프 밖 1회 계산
+float2 aspectScale = BaseAspect >= 1.0 
+    ? float2(1.0, 1.0 / BaseAspect) 
+    : float2(BaseAspect, 1.0);
+
+float finalDist = 1e6;
+float3 finalNormal = float3(0, 0, 1);
+
+for (int i = 1; i <= num_instances; i++) {
+    uint ui = uint(i);
+    
+    // Integer hash - sin 4회 제거
+    float h_pos_x = SDFHelper::hash(ui * 2u);
+    float h_pos_y = SDFHelper::hash(ui * 3u);
+    float h_speed = SDFHelper::hash(ui * 5u);
+    float h_size  = SDFHelper::hash(ui * 17u);
+    float h_time  = SDFHelper::hash(ui * 23u);
+    
+    float speed = MasterSpeed * lerp(minMult, maxMult, h_speed);
+    float size = MasterSize * lerp(minMult, maxMult, h_size);
+    
+    // Stretch - 분기 제거, branchless
+    float absSpeed = abs(speed);
+    float normalizedSpeed = saturate((absSpeed - speedThreshold) * invSpeedStretch);
+    float stretchFactor = lerp(1.0, SpeedStretch, normalizedSpeed);
+    
+    float2 scale = float2(1.0 / stretchFactor, stretchFactor) * aspectScale;
+    
+    // 최대 차원 정규화 - 분기 제거
+    float maxScale = max(1.0 / scale.x, 1.0 / scale.y);
+    scale *= max(1.0, maxScale);
+    
+    // Position
+    float effectiveRadiusY = size / scale.y;
+    float safeYRange = max(0.0, 0.5 - (effectiveRadiusY + smoothHalf));
+    float posY = lerp(-safeYRange, safeYRange, h_pos_y);
+    
+    float wrappedX = frac((lerp(-halfCluster, halfCluster, h_pos_x) 
+                    + (gameTime + h_time * TimeOffset) * speed) * invRepeat) 
+                    * repeatSize - halfRepeat;
+    
+    float2 diff = (p - float2(wrappedX, posY)) * scale;
+    
+    // Wrap: 가장 가까운 repeat 1개만 추가 계산 (3→2 length)
+    float repScaleX = repeatSize * scale.x;
+    float shiftDir = diff.x > 0 ? -repScaleX : repScaleX;
+    float2 wrapOffset = float2(diff.x + shiftDir, diff.y);
+    
+    float dist_center = length(diff) - size;
+    float dist_wrap = length(wrapOffset) - size;
+    
+    bool wrapCloser = dist_wrap < dist_center;
+    float dist = wrapCloser ? dist_wrap : dist_center;
+    float2 closest = wrapCloser ? wrapOffset : diff;
+    
+    // 노멀: 블렌딩용 방향만 계산, normalize는 최종 1회
+    float corrSize = size + smoothHalf;
+    float z_sq = corrSize * corrSize - dot(closest, closest);
+    float3 normal = float3(closest / scale, sqrt(max(0, z_sq)));
+    
+    // smin 블렌딩
+    if (i == 1) {
+        finalDist = dist;
+        finalNormal = normal;
+    } else {
+        float h;
+        finalDist = SDFHelper::smin(finalDist, dist, smoothnessK, h);
+        finalNormal = lerp(normal, finalNormal, h);
+    }
+}
+
+// normalize 최종 1회
+finalNormal = normalize(finalNormal);
+return float4(finalNormal, finalDist);
