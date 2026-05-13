@@ -1,0 +1,1 @@
+ python shader_explorer.py "C:\Program Files\Epic Games\UE_5.5\Engine\Shaders" "C:\Users\parkj\Documents\ShaderExplorer_5_5.html"

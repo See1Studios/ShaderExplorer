@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UE5 Shader Explorer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css" rel="stylesheet">
+<style>* { margin:0; padding:0; box-sizing:border-box; } html,body,#root { width:100%; height:100%; overflow:hidden; }</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useCallback, useRef, useEffect } = React;
+
+const EXTENSIONS = new Set(['.ush','.usf','.hlsl','.h']);
+
+function parseShaderFile(filename, content) {
+  const lines = content.split('\n');
+  const includes=[], structs=[], functions=[], defines=[];
+  const incRe=/#include\s+"([^"]+)"/;
+  const structRe=/^\s*struct\s+(\w+)/;
+  const defRe=/^\s*#define\s+(\w+)(?:\s*\(([^)]*)\))?\s*(.*?)\\?$/;
+  const funcRe=/^[ \t]*(?:inline\s+|static\s+|export\s+)*([\w]+)\s+(\w+)\s*\(/;
+  const SKIP=new Set(['if','else','for','while','switch','return','struct','class','enum','do','case','defined','pragma','ifdef','ifndef','endif','elif','include','define','undef','error','warning']);
+  let inStruct=false, sName='', sMembers=[], sLine=0, depth=0;
+  for(let i=0;i<lines.length;i++){
+    const ls=lines[i].trim();
+    const m1=ls.match(incRe);
+    if(m1){const p=m1[1].split('/');includes.push(p[p.length-1]);continue;}
+    if(!inStruct){const m2=ls.match(structRe);if(m2){inStruct=true;sName=m2[1];sLine=i+1;sMembers=[];depth=(ls.match(/\{/g)||[]).length-(ls.match(/\}/g)||[]).length;continue;}}
+    if(inStruct){depth+=(ls.match(/\{/g)||[]).length-(ls.match(/\}/g)||[]).length;if(depth<=0){structs.push({n:sName,m:sMembers.slice(0,6),l:sLine});inStruct=false;}else if(ls&&!ls.startsWith('//')&&!ls.startsWith('#')&&!ls.startsWith('{')){const pm=ls.match(/^([\w]+)\s+(\w+)/);if(pm)sMembers.push(pm[1]+' '+pm[2]);}continue;}
+    const m3=ls.match(defRe);
+    if(m3){const dn=m3[1];if(!dn.startsWith('_')&&dn!=='PRAGMA_ONCE'&&dn.length>2)defines.push({n:dn,v:(m3[3]||'').trim().slice(0,30),l:i+1});continue;}
+    const m4=lines[i].match(funcRe);
+    if(m4){const r=m4[1],fn=m4[2];if(!SKIP.has(fn)&&!SKIP.has(r)&&!fn.startsWith('_'))functions.push({n:fn,r:r,l:i+1});}
+  }
+  return {f:filename,i:includes,s:structs,fn:functions,d:defines.slice(0,40)};
+}
+
+const KC={struct:'#4fc1ff',function:'#dcdcaa',define:'#c586c0'};
+const KI={struct:'S',function:'F',define:'D'};
+const Badge=({kind})=><span style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:18,height:18,borderRadius:3,fontSize:11,fontWeight:700,backgroundColor:KC[kind]+'22',color:KC[kind],border:`1px solid ${KC[kind]}44`,flexShrink:0,marginRight:6}}>{KI[kind]}</span>;
+
+function SymbolItem({name,kind,line,extra,onRefClick,onCodeClick,refCount}){
+  return <div style={{padding:'5px 10px',borderBottom:'1px solid #1e1e1e',display:'flex',alignItems:'flex-start',gap:4}}>
+    <Badge kind={kind}/>
+    <div style={{flex:1,minWidth:0}}>
+      <div style={{display:'flex',alignItems:'center',gap:6}}>
+        <span style={{color:KC[kind],fontFamily:"'JetBrains Mono',monospace",fontSize:13,fontWeight:600}}>{name}</span>
+        <span style={{color:'#555',fontSize:11}}>:{line}</span>
+        {refCount>1&&<span onClick={()=>onRefClick(name)} style={{cursor:'pointer',fontSize:10,color:'#888',backgroundColor:'#333',padding:'1px 5px',borderRadius:8}}>{refCount} refs</span>}
+        <span onClick={()=>onCodeClick(line)} style={{cursor:'pointer',fontSize:10,color:'#888',backgroundColor:'#333',padding:'1px 5px',borderRadius:8}} title="View source code">code</span>
+      </div>
+      {extra&&<div style={{color:'#888',fontSize:11,fontFamily:"'JetBrains Mono',monospace",marginTop:2}}>{extra}</div>}
+    </div>
+  </div>;
+}
+
+function IncludeTree({file,fileMap,onNav,depth=0,visited=new Set()}){
+  const f=fileMap[file]; if(!f||depth>4||visited.has(file))return null; visited.add(file);
+  return <div style={{marginLeft:depth*16}}>
+    <div onClick={()=>onNav(file)} style={{cursor:'pointer',fontSize:12,fontFamily:"'JetBrains Mono',monospace",color:depth===0?'#4fc1ff':'#9cdcfe',padding:'2px 0'}}
+      onMouseEnter={e=>e.currentTarget.style.textDecoration='underline'} onMouseLeave={e=>e.currentTarget.style.textDecoration='none'}>
+      {depth>0&&<span style={{color:'#444'}}>└─ </span>}{file}
+    </div>
+    {f.i.map(inc=><IncludeTree key={inc} file={inc} fileMap={fileMap} onNav={onNav} depth={depth+1} visited={new Set(visited)}/>)}
+  </div>;
+}
+
+function RefPanel({symbol,symIndex,onClose,onNav,onCode}){
+  const refs=symIndex[symbol]||[];
+  return <div style={{position:'absolute',right:0,top:0,bottom:0,width:320,backgroundColor:'#1e1e1e',borderLeft:'1px solid #333',zIndex:10,display:'flex',flexDirection:'column'}}>
+    <div style={{padding:'8px 12px',borderBottom:'1px solid #333',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <div><span style={{color:'#ccc',fontSize:13,fontWeight:600}}>References: </span><span style={{color:'#dcdcaa',fontFamily:"'JetBrains Mono',monospace",fontSize:13}}>{symbol}</span></div>
+      <span onClick={onClose} style={{cursor:'pointer',color:'#888',fontSize:16}}>✕</span>
+    </div>
+    <div style={{overflowY:'auto',flex:1}}>
+      {refs.map((r,i)=><div key={i} style={{padding:'6px 12px',borderBottom:'1px solid #1a1a1a',display:'flex',alignItems:'center',gap:8}}
+        onMouseEnter={e=>e.currentTarget.style.backgroundColor='#2a2d2e'} onMouseLeave={e=>e.currentTarget.style.backgroundColor='transparent'}>
+        <Badge kind={r.kind}/>
+        <div style={{flex:1,cursor:'pointer'}} onClick={()=>onNav(r.file)}><div style={{color:'#ccc',fontSize:12,fontFamily:"'JetBrains Mono',monospace"}}>{r.file}</div><div style={{color:'#555',fontSize:11}}>line {r.line}</div></div>
+        <span onClick={()=>{onNav(r.file);onCode({file:r.file,line:r.line});}} style={{cursor:'pointer',fontSize:10,color:'#888',backgroundColor:'#333',padding:'1px 5px',borderRadius:8}}>code</span>
+      </div>)}
+    </div>
+  </div>;
+}
+
+// HLSL syntax highlighting
+const SYN_TYPES=/\b(void|bool|int|uint|float|half|double|min16float|min16int|min16uint|string|float[1-4]|half[1-4]|int[1-4]|uint[1-4]|bool[1-4]|float[1-4]x[1-4]|half[1-4]x[1-4]|Texture2D|Texture3D|TextureCube|Texture2DArray|TextureCubeArray|RWTexture2D|RWTexture3D|SamplerState|SamplerComparisonState|StructuredBuffer|RWStructuredBuffer|ByteAddressBuffer|RWByteAddressBuffer|Buffer|RWBuffer|MaterialFloat|MaterialFloat[2-4]|MaterialFloat[3-4]x[3-4]|FDFVector[2-4]|FDFScalar|FDFMatrix|FDFInverseMatrix|FLWCVector[2-4]|FLWCScalar|FLWCMatrix)\b/;
+const SYN_KW=/\b(if|else|for|while|do|switch|case|default|break|continue|return|discard|struct|class|enum|typedef|const|static|inline|inout|in|out|uniform|groupshared|nointerpolation|noperspective|precise|volatile|export|template|typename)\b/;
+const SYN_BUILTIN=/\b(saturate|lerp|clamp|min|max|abs|sign|floor|ceil|round|frac|fmod|pow|sqrt|rsqrt|log|log2|log10|exp|exp2|sin|cos|tan|asin|acos|atan|atan2|dot|cross|normalize|length|distance|reflect|refract|mul|transpose|determinant|clip|step|smoothstep|mad|rcp|ddx|ddy|ddx_coarse|ddy_coarse|ddx_fine|ddy_fine|all|any|countbits|firstbithigh|firstbitlow|reversebits|asuint|asfloat|asint|f16tof32|f32tof16|InterlockedAdd|InterlockedMin|InterlockedMax|InterlockedOr|InterlockedAnd|InterlockedXor|GroupMemoryBarrierWithGroupSync|GroupMemoryBarrier|DeviceMemoryBarrier|AllMemoryBarrier|WaveActiveSum|WaveActiveMin|WaveActiveMax|WaveActiveBallot|WaveReadLaneFirst|WaveReadLaneAt|WaveIsFirstLane|WaveGetLaneIndex|WaveGetLaneCount|QuadReadLaneAt|QuadReadAcrossX|QuadReadAcrossY)\b/;
+const SYN_NUM=/\b(\d+\.?\d*[fFhH]?|\.\d+[fFhH]?|0[xX][0-9a-fA-F]+[uU]?)\b/;
+
+function hlLine(text, inBlock){
+  const tokens=[];
+  let pos=0;
+  while(pos<text.length){
+    if(inBlock){
+      const end=text.indexOf('*/',pos);
+      if(end>=0){tokens.push({c:'#6a9955',t:text.slice(pos,end+2)});pos=end+2;inBlock=false;continue;}
+      else{tokens.push({c:'#6a9955',t:text.slice(pos)});return{tokens,inBlock:true};}
+    }
+    // line comment
+    if(text[pos]==='/'&&text[pos+1]==='/'){tokens.push({c:'#6a9955',t:text.slice(pos)});return{tokens,inBlock};}
+    // block comment start
+    if(text[pos]==='/'&&text[pos+1]==='*'){inBlock=true;pos+=2;
+      const end=text.indexOf('*/',pos);
+      if(end>=0){tokens.push({c:'#6a9955',t:'/*'+text.slice(pos,end+2)});pos=end+2;inBlock=false;continue;}
+      else{tokens.push({c:'#6a9955',t:'/*'+text.slice(pos)});return{tokens,inBlock:true};}
+    }
+    // preprocessor
+    if(pos===0||text.slice(0,pos).trim()===''){
+      const pp=text.slice(pos).match(/^(\s*#\w+)/);
+      if(pp){tokens.push({c:'#c586c0',t:pp[1]});pos+=pp[1].length;continue;}
+    }
+    // string
+    if(text[pos]==='"'){const end=text.indexOf('"',pos+1);const s=end>=0?text.slice(pos,end+1):text.slice(pos);tokens.push({c:'#ce9178',t:s});pos+=s.length;continue;}
+    // word
+    const wm=text.slice(pos).match(/^[a-zA-Z_]\w*/);
+    if(wm){
+      const w=wm[0];
+      if(SYN_TYPES.test(w))tokens.push({c:'#4ec9b0',t:w});
+      else if(SYN_KW.test(w))tokens.push({c:'#569cd6',t:w});
+      else if(SYN_BUILTIN.test(w))tokens.push({c:'#dcdcaa',t:w});
+      else tokens.push({c:null,t:w});
+      pos+=w.length;continue;
+    }
+    // number
+    const nm=text.slice(pos).match(/^\d+\.?\d*[fFhHuU]?|^\.\d+[fFhHuU]?|^0[xX][0-9a-fA-F]+[uU]?/);
+    if(nm){tokens.push({c:'#b5cea8',t:nm[0]});pos+=nm[0].length;continue;}
+    // other
+    tokens.push({c:null,t:text[pos]});pos++;
+  }
+  return{tokens,inBlock};
+}
+
+function CodePanel({file,line,onClose,fileMap,rightOffset=0}){
+  const f=fileMap[file];
+  if(!f||!f.src)return null;
+  const allLines=f.src.split('\n');
+  const gutterW=String(allLines.length).length;
+  const codeRef=useRef(null);
+  useEffect(()=>{
+    if(codeRef.current){const hl=codeRef.current.querySelector('[data-hl]');if(hl)hl.scrollIntoView({block:'center'});}
+  },[file,line]);
+
+  const highlighted=useMemo(()=>{
+    let inBlock=false;
+    return allLines.map((ln,i)=>{
+      const r=hlLine(ln,inBlock);inBlock=r.inBlock;
+      return r.tokens;
+    });
+  },[f.src]);
+
+  return <div style={{position:'absolute',right:rightOffset,top:0,bottom:0,width:rightOffset?'calc(55% - '+rightOffset+'px)':'55%',minWidth:300,backgroundColor:'#1e1e1e',borderLeft:'1px solid #333',zIndex:9,display:'flex',flexDirection:'column'}}>
+    <div style={{padding:'8px 12px',borderBottom:'1px solid #333',display:'flex',justifyContent:'space-between',alignItems:'center',flexShrink:0}}>
+      <div style={{display:'flex',alignItems:'center',gap:8}}>
+        <span style={{color:'#e5c07b',fontFamily:"'JetBrains Mono',monospace",fontSize:13,fontWeight:600}}>{file}</span>
+        <span style={{color:'#555',fontSize:11}}>line {line} / {allLines.length}</span>
+      </div>
+      <span onClick={onClose} style={{cursor:'pointer',color:'#888',fontSize:16}}>✕</span>
+    </div>
+    <div ref={codeRef} style={{flex:1,overflowY:'auto',overflowX:'auto'}}>
+      <pre style={{margin:0,padding:'8px 0',fontSize:12,lineHeight:1.7,fontFamily:"'JetBrains Mono',monospace"}}>
+        {highlighted.map((tokens,i)=>{
+          const num=i+1;
+          const isTarget=num===line;
+          return <div key={num} data-hl={isTarget?'1':undefined} style={{
+            display:'flex',backgroundColor:isTarget?'#264f78':'transparent',
+            borderLeft:isTarget?'3px solid #007acc':'3px solid transparent',
+          }}>
+            <span style={{display:'inline-block',width:gutterW*8+16,textAlign:'right',paddingRight:12,color:isTarget?'#007acc':'#555',flexShrink:0,userSelect:'none'}}>{num}</span>
+            <span style={{whiteSpace:'pre',paddingRight:16}}>{tokens.map((tk,j)=>
+              tk.c?<span key={j} style={{color:tk.c}}>{tk.t}</span>:<span key={j} style={{color:isTarget?'#fff':'#ccc'}}>{tk.t}</span>
+            )}</span>
+          </div>;
+        })}
+      </pre>
+    </div>
+  </div>;
+}
+
+function SearchResults({query,symIndex,onNav}){
+  const results=useMemo(()=>{
+    if(!query||query.length<2)return[];
+    const q=query.toLowerCase(),r=[];
+    for(const[name,refs]of Object.entries(symIndex)){if(name.toLowerCase().includes(q)){r.push({name,refs});if(r.length>=50)break;}}
+    return r;
+  },[query,symIndex]);
+  if(!query||query.length<2)return null;
+  return <div style={{position:'absolute',top:40,left:'50%',transform:'translateX(-50%)',width:500,maxHeight:400,backgroundColor:'#252526',border:'1px solid #007acc',borderRadius:4,overflow:'auto',zIndex:20,boxShadow:'0 8px 32px rgba(0,0,0,.5)'}}>
+    {results.length===0&&<div style={{padding:16,color:'#666',fontSize:13}}>No results</div>}
+    {results.map(r=><div key={r.name} style={{borderBottom:'1px solid #1e1e1e'}}>
+      {r.refs.map((ref,i)=><div key={i} onClick={()=>onNav(ref.file)} style={{padding:'6px 12px',cursor:'pointer',display:'flex',alignItems:'center',gap:8}}
+        onMouseEnter={e=>e.currentTarget.style.backgroundColor='#2a2d2e'} onMouseLeave={e=>e.currentTarget.style.backgroundColor='transparent'}>
+        <Badge kind={ref.kind}/><span style={{color:KC[ref.kind],fontFamily:"'JetBrains Mono',monospace",fontSize:13}}>{r.name}</span>
+        <span style={{color:'#666',fontSize:11,fontFamily:"'JetBrains Mono',monospace",marginLeft:'auto'}}>{ref.file}:{ref.line}</span>
+      </div>)}
+    </div>)}
+  </div>;
+}
+
+function buildTree(files, filter) {
+  const filtered = filter
+    ? files.filter(f => f.f.toLowerCase().includes(filter.toLowerCase()))
+    : files;
+  const root = { name: '', children: {}, files: [] };
+  filtered.forEach(f => {
+    const parts = (f.dir || '').split('/').filter(Boolean);
+    let node = root;
+    // Skip common root prefix - just use last 2 levels max for display
+    parts.forEach(p => {
+      if (!node.children[p]) node.children[p] = { name: p, children: {}, files: [] };
+      node = node.children[p];
+    });
+    node.files.push(f);
+  });
+  // Collapse single-child chains: if a folder has no files and one child, merge
+  const collapse = (node) => {
+    const childKeys = Object.keys(node.children);
+    childKeys.forEach(k => collapse(node.children[k]));
+    if (childKeys.length === 1 && node.files.length === 0 && node.name) {
+      const child = node.children[childKeys[0]];
+      node.name = node.name + '/' + child.name;
+      node.children = child.children;
+      node.files = child.files;
+    }
+  };
+  collapse(root);
+  return root;
+}
+
+function FileTreeNode({ node, selected, onSelect, expanded, toggleExpand, path, depth }) {
+  const childKeys = Object.keys(node.children).sort();
+  const sortedFiles = [...node.files].sort((a, b) => a.f.localeCompare(b.f));
+  const isExpanded = expanded.has(path);
+  const hasContent = childKeys.length > 0 || sortedFiles.length > 0;
+  const totalCount = sortedFiles.length + childKeys.reduce((sum, k) => {
+    const count = (n) => n.files.length + Object.values(n.children).reduce((s, c) => s + count(c), 0);
+    return sum + count(node.children[k]);
+  }, 0);
+
+  return <div>
+    {node.name && <div onClick={() => toggleExpand(path)}
+      style={{ padding: '3px 4px 3px ' + (depth * 12 + 4) + 'px', cursor: 'pointer', fontSize: 12, color: '#ccc', display: 'flex', alignItems: 'center', gap: 4, userSelect: 'none' }}
+      onMouseEnter={e => e.currentTarget.style.backgroundColor = '#2a2d2e'} onMouseLeave={e => e.currentTarget.style.backgroundColor = 'transparent'}>
+      <span style={{ color: '#666', fontSize: 10, width: 12, textAlign: 'center', flexShrink: 0 }}>{hasContent ? (isExpanded ? '▼' : '▶') : ' '}</span>
+      <span style={{ color: '#e5c07b', fontSize: 11 }}>📁</span>
+      <span style={{ color: '#ccc', fontSize: 12, fontFamily: "'Pretendard Variable','Pretendard',system-ui,sans-serif" }}>{node.name}</span>
+      <span style={{ color: '#555', fontSize: 10, marginLeft: 'auto', paddingRight: 4 }}>{totalCount}</span>
+    </div>}
+    {(isExpanded || !node.name) && <>
+      {childKeys.map(k => <FileTreeNode key={k} node={node.children[k]} selected={selected} onSelect={onSelect}
+        expanded={expanded} toggleExpand={toggleExpand} path={path + '/' + node.children[k].name} depth={node.name ? depth + 1 : depth} />)}
+      {sortedFiles.map(f => <div key={f.f} onClick={() => onSelect(f.f)}
+        style={{
+          padding: '3px 8px 3px ' + ((node.name ? depth + 1 : depth) * 12 + 20) + 'px',
+          cursor: 'pointer', fontSize: 12, fontFamily: "'JetBrains Mono',monospace",
+          backgroundColor: f.f === selected ? '#264f78' : 'transparent',
+          color: f.f === selected ? '#fff' : '#bbb',
+          borderLeft: f.f === selected ? '2px solid #007acc' : '2px solid transparent',
+        }}
+        onMouseEnter={e => { if (f.f !== selected) e.currentTarget.style.backgroundColor = '#2a2d2e'; }}
+        onMouseLeave={e => { if (f.f !== selected) e.currentTarget.style.backgroundColor = 'transparent'; }}>
+        <span style={{ color: '#666', marginRight: 4 }}>{f.f.endsWith('.ush') ? '◆' : f.f.endsWith('.usf') ? '◇' : f.f.endsWith('.h') ? '●' : '○'}</span>
+        {f.f}
+        <span style={{ color: '#555', marginLeft: 6, fontSize: 10 }}>{f.s.length + f.fn.length + f.d.length}</span>
+      </div>)}
+    </>}
+  </div>;
+}
+
+function App(){
+  const[data,setData]=useState(null);
+  const[loading,setLoading]=useState(false);
+  const[progress,setProgress]=useState(0);
+  const[status,setStatus]=useState('');
+  const[selected,setSelected]=useState('');
+  const[fileFilter,setFileFilter]=useState('');
+  const[searchQuery,setSearchQuery]=useState('');
+  const[showSearch,setShowSearch]=useState(false);
+  const[refSymbol,setRefSymbol]=useState(null);
+  const[codeView,setCodeView]=useState(null); // {file, line}
+  const[tab,setTab]=useState('symbols');
+  const[expanded,setExpanded]=useState(new Set());
+  const[sidebarW,setSidebarW]=useState(280);
+  const dragging=useRef(false);
+  const searchRef=useRef(null);
+  const inputRef=useRef(null);
+
+  const handleFiles=useCallback(async(fileList)=>{
+    setLoading(true);setProgress(0);setStatus('Filtering shader files...');
+    await new Promise(r=>setTimeout(r,30));
+
+    const shaderFiles=[];
+    for(let i=0;i<fileList.length;i++){
+      const ext='.'+fileList[i].name.split('.').pop().toLowerCase();
+      if(EXTENSIONS.has(ext))shaderFiles.push(fileList[i]);
+    }
+
+    if(shaderFiles.length===0){
+      setStatus(`${fileList.length} files scanned, 0 shader files found.`);
+      setLoading(false);return;
+    }
+
+    setStatus(`Parsing ${shaderFiles.length} shader files...`);
+    await new Promise(r=>setTimeout(r,30));
+
+    const results=[];
+    for(let i=0;i<shaderFiles.length;i++){
+      try{
+        const text=await shaderFiles[i].text();
+        const parsed=parseShaderFile(shaderFiles[i].name,text);
+        parsed.src=text;
+        const rp=shaderFiles[i].webkitRelativePath||'';
+        const parts=rp.split('/');
+        parsed.dir=parts.length>1?parts.slice(0,-1).join('/'):'';
+        results.push(parsed);
+      }catch{}
+      if(i%20===0){setProgress((i/shaderFiles.length)*100);setStatus(`Parsing ${i+1}/${shaderFiles.length}: ${shaderFiles[i].name}`);await new Promise(r=>setTimeout(r,0));}
+    }
+
+    setProgress(100);setData(results);
+    if(results.length>0){const c=results.find(r=>r.f==='Common.ush');setSelected(c?'Common.ush':results[0].f);}
+    setLoading(false);
+  },[]);
+
+  const onInputChange=useCallback((e)=>{
+    if(e.target.files&&e.target.files.length>0) handleFiles(e.target.files);
+  },[handleFiles]);
+
+  const{fileMap,symIndex,includedBy,stats}=useMemo(()=>{
+    if(!data)return{fileMap:{},symIndex:{},includedBy:{},stats:{files:0,structs:0,funcs:0,defines:0}};
+    const fm={},si={},ib={};
+    data.forEach(f=>{fm[f.f]=f;
+      f.s.forEach(s=>{if(!si[s.n])si[s.n]=[];si[s.n].push({file:f.f,kind:'struct',line:s.l});});
+      f.fn.forEach(fn=>{if(!si[fn.n])si[fn.n]=[];si[fn.n].push({file:f.f,kind:'function',line:fn.l});});
+      f.d.forEach(d=>{if(!si[d.n])si[d.n]=[];si[d.n].push({file:f.f,kind:'define',line:d.l});});
+      f.i.forEach(inc=>{if(!ib[inc])ib[inc]=[];ib[inc].push(f.f);});
+    });
+    return{fileMap:fm,symIndex:si,includedBy:ib,stats:{files:data.length,structs:data.reduce((a,f)=>a+f.s.length,0),funcs:data.reduce((a,f)=>a+f.fn.length,0),defines:data.reduce((a,f)=>a+f.d.length,0)}};
+  },[data]);
+
+  const file=fileMap[selected];
+  const revIncludes=useMemo(()=>includedBy[selected]||[],[includedBy,selected]);
+  const onNav=useCallback((fname)=>{if(fileMap[fname]){setSelected(fname);setShowSearch(false);setSearchQuery('');}},[fileMap]);
+
+  // Sidebar resize
+  const startResize=useCallback((e)=>{e.preventDefault();dragging.current=true;document.body.style.cursor='col-resize';document.body.style.userSelect='none';},[]);
+  useEffect(()=>{
+    const onMove=(e)=>{if(dragging.current)setSidebarW(Math.max(180,Math.min(500,e.clientX)));};
+    const onUp=()=>{dragging.current=false;document.body.style.cursor='';document.body.style.userSelect='';};
+    window.addEventListener('mousemove',onMove);window.addEventListener('mouseup',onUp);
+    return()=>{window.removeEventListener('mousemove',onMove);window.removeEventListener('mouseup',onUp);};
+  },[]);
+
+  useEffect(()=>{
+    const h=(e)=>{if((e.ctrlKey||e.metaKey)&&e.key==='p'){e.preventDefault();setShowSearch(v=>!v);setTimeout(()=>searchRef.current?.focus(),50);}if(e.key==='Escape'){setShowSearch(false);setSearchQuery('');setRefSymbol(null);setCodeView(null);}};
+    window.addEventListener('keydown',h);return()=>window.removeEventListener('keydown',h);
+  },[]);
+
+  const filteredFiles=useMemo(()=>{if(!data)return[];if(!fileFilter)return data;const q=fileFilter.toLowerCase();return data.filter(f=>f.f.toLowerCase().includes(q));},[data,fileFilter]);
+
+  const tree=useMemo(()=>data?buildTree(data,fileFilter):null,[data,fileFilter]);
+
+  const toggleExpand=useCallback((path)=>{
+    setExpanded(prev=>{const next=new Set(prev);if(next.has(path))next.delete(path);else next.add(path);return next;});
+  },[]);
+
+  // Only expand root-level folders by default
+  useEffect(()=>{
+    if(!data)return;
+    const t=buildTree(data,'');
+    const paths=new Set();
+    Object.keys(t.children).forEach(k=>paths.add('/'+t.children[k].name));
+    setExpanded(paths);
+  },[data]);
+
+  if(!data) return (
+    <div style={{width:'100%',height:'100vh',display:'flex',alignItems:'center',justifyContent:'center',backgroundColor:'#1e1e1e',color:'#ccc',fontFamily:"'Pretendard Variable','Pretendard',system-ui,-apple-system,sans-serif"}}>
+      <div style={{width:520,padding:48,borderRadius:12,textAlign:'center',border:'2px dashed #444',backgroundColor:'#252526'}}>
+        <div style={{fontSize:48,marginBottom:16}}>📂</div>
+        <div style={{fontSize:20,fontWeight:600,marginBottom:16}}>UE5 Shader Explorer</div>
+        {loading?(
+          <div>
+            <div style={{width:'100%',height:4,backgroundColor:'#333',borderRadius:2,overflow:'hidden'}}><div style={{width:`${progress}%`,height:'100%',backgroundColor:'#007acc',transition:'width 0.15s'}}/></div>
+            <div style={{color:'#888',fontSize:13,marginTop:8}}>{Math.round(progress)}%</div>
+            {status&&<div style={{color:'#666',fontSize:11,marginTop:4,fontFamily:"'JetBrains Mono',monospace"}}>{status}</div>}
+          </div>
+        ):(
+          <div>
+            <input ref={inputRef} type="file" webkitdirectory="" directory="" multiple style={{display:'none'}} onChange={onInputChange}/>
+            <div onClick={()=>inputRef.current?.click()}
+              style={{display:'inline-block',padding:'10px 28px',backgroundColor:'#007acc',color:'#fff',borderRadius:6,cursor:'pointer',fontSize:15,fontWeight:600,marginBottom:16}}
+              onMouseEnter={e=>e.currentTarget.style.backgroundColor='#0098ff'} onMouseLeave={e=>e.currentTarget.style.backgroundColor='#007acc'}>
+              Select Shader Folder
+            </div>
+            <div style={{color:'#555',fontSize:12,lineHeight:1.8}}>
+              Point to <code style={{backgroundColor:'#333',padding:'2px 6px',borderRadius:3,color:'#e5c07b'}}>Engine/Shaders</code> or any subfolder
+              <br/>Parses <code style={{color:'#666'}}>.ush</code> / <code style={{color:'#666'}}>.usf</code> / <code style={{color:'#666'}}>.hlsl</code> / <code style={{color:'#666'}}>.h</code>
+            </div>
+            {status&&<div style={{color:'#e06c75',fontSize:12,marginTop:12,fontFamily:"'JetBrains Mono',monospace"}}>{status}</div>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{width:'100%',height:'100vh',display:'flex',flexDirection:'column',backgroundColor:'#1e1e1e',color:'#ccc',fontFamily:"'Pretendard Variable','Pretendard',system-ui,-apple-system,sans-serif",overflow:'hidden'}}>
+      <div style={{height:40,backgroundColor:'#2d2d2d',borderBottom:'1px solid #3c3c3c',display:'flex',alignItems:'center',padding:'0 12px',gap:12,flexShrink:0,position:'relative'}}>
+        <span style={{fontSize:15,fontWeight:700,color:'#e06c75',fontFamily:"'JetBrains Mono',monospace"}}>UE5</span>
+        <span style={{fontSize:14,fontWeight:600,color:'#999'}}>Shader Explorer</span>
+        <div style={{display:'flex',gap:12,marginLeft:16,fontSize:11,color:'#666'}}>
+          <span>{stats.files} files</span><span style={{color:'#4fc1ff'}}>{stats.structs} S</span><span style={{color:'#dcdcaa'}}>{stats.funcs} F</span><span style={{color:'#c586c0'}}>{stats.defines} D</span>
+        </div>
+        <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8}}>
+          <div onClick={()=>{setData(null);setSelected('');setStatus('');}} style={{padding:'4px 10px',backgroundColor:'#3c3c3c',borderRadius:4,cursor:'pointer',fontSize:11,color:'#888'}}>Change Folder</div>
+          <div onClick={()=>{setShowSearch(v=>!v);setTimeout(()=>searchRef.current?.focus(),50);}} style={{padding:'4px 12px',backgroundColor:'#3c3c3c',borderRadius:4,cursor:'pointer',fontSize:12,color:'#888',display:'flex',alignItems:'center',gap:8}}>
+            <span>Search...</span><kbd style={{fontSize:10,color:'#555',backgroundColor:'#2a2a2a',padding:'1px 4px',borderRadius:2}}>Ctrl+P</kbd>
+          </div>
+        </div>
+        {showSearch&&<>
+          <div style={{position:'absolute',top:40,left:'50%',transform:'translateX(-50%)',width:500,zIndex:21}}>
+            <input ref={searchRef} value={searchQuery} onChange={e=>setSearchQuery(e.target.value)} placeholder="Search symbols..."
+              style={{width:'100%',padding:'8px 12px',backgroundColor:'#3c3c3c',border:'1px solid #007acc',borderRadius:'4px 4px 0 0',color:'#ccc',fontSize:14,outline:'none',fontFamily:"'JetBrains Mono',monospace",boxSizing:'border-box'}}/>
+          </div>
+          <SearchResults query={searchQuery} symIndex={symIndex} onNav={onNav}/>
+        </>}
+      </div>
+      <div style={{display:'flex',flex:1,overflow:'hidden',position:'relative'}}>
+        <div style={{width:sidebarW,backgroundColor:'#252526',display:'flex',flexDirection:'column',flexShrink:0,overflow:'hidden'}}>
+          <div style={{padding:8,borderBottom:'1px solid #3c3c3c'}}>
+            <input value={fileFilter} onChange={e=>setFileFilter(e.target.value)} placeholder="Filter files..."
+              style={{width:'100%',padding:'4px 8px',backgroundColor:'#3c3c3c',border:'1px solid #555',borderRadius:3,color:'#ccc',fontSize:12,outline:'none',boxSizing:'border-box'}}/>
+          </div>
+          <div style={{overflowY:'auto',flex:1}}>
+            {tree && <FileTreeNode node={tree} selected={selected} onSelect={setSelected}
+              expanded={expanded} toggleExpand={toggleExpand} path="" depth={0} />}
+          </div>
+        </div>
+        <div onMouseDown={startResize} style={{width:4,cursor:'col-resize',backgroundColor:'transparent',flexShrink:0,position:'relative',zIndex:5}}
+          onMouseEnter={e=>e.currentTarget.style.backgroundColor='#007acc'} onMouseLeave={e=>{if(!dragging.current)e.currentTarget.style.backgroundColor='transparent';}} />
+        <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
+          {file?<>
+            <div style={{padding:'8px 16px',borderBottom:'1px solid #3c3c3c',backgroundColor:'#2d2d2d',display:'flex',alignItems:'center',gap:12}}>
+              <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:14,fontWeight:600,color:'#e5c07b'}}>{file.f}</span>
+              <span style={{fontSize:11,color:'#666'}}>{file.s.length}S · {file.fn.length}F · {file.d.length}D · {file.i.length} inc</span>
+            </div>
+            <div style={{display:'flex',borderBottom:'1px solid #3c3c3c',backgroundColor:'#252526'}}>
+              {[{id:'symbols',label:'Symbols'},{id:'includes',label:`Includes (${file.i.length})`},{id:'includedBy',label:`Included By (${revIncludes.length})`}].map(t=>
+                <div key={t.id} onClick={()=>setTab(t.id)} style={{padding:'6px 16px',cursor:'pointer',fontSize:12,borderBottom:tab===t.id?'2px solid #007acc':'2px solid transparent',color:tab===t.id?'#fff':'#888'}}>{t.label}</div>
+              )}
+            </div>
+            <div style={{flex:1,overflowY:'auto'}}>
+              {tab==='symbols'&&<div>
+                {file.s.length>0&&<><div style={{padding:'8px 12px',fontSize:11,color:'#888',fontWeight:600,backgroundColor:'#1a1a1a',textTransform:'uppercase',letterSpacing:1}}>Structs ({file.s.length})</div>
+                  {file.s.map(s=><SymbolItem key={s.n+s.l} name={s.n} kind="struct" line={s.l} extra={s.m.join(', ')} onRefClick={(n)=>setRefSymbol(v=>v===n?null:n)} onCodeClick={(ln)=>setCodeView(v=>v&&v.file===selected&&v.line===ln?null:{file:selected,line:ln})} refCount={(symIndex[s.n]||[]).length}/>)}</>}
+                {file.fn.length>0&&<><div style={{padding:'8px 12px',fontSize:11,color:'#888',fontWeight:600,backgroundColor:'#1a1a1a',textTransform:'uppercase',letterSpacing:1}}>Functions ({file.fn.length})</div>
+                  {file.fn.map((fn,i)=><SymbolItem key={fn.n+i} name={fn.n} kind="function" line={fn.l} extra={fn.r!==fn.n?fn.r:undefined} onRefClick={(n)=>setRefSymbol(v=>v===n?null:n)} onCodeClick={(ln)=>setCodeView(v=>v&&v.file===selected&&v.line===ln?null:{file:selected,line:ln})} refCount={(symIndex[fn.n]||[]).length}/>)}</>}
+                {file.d.length>0&&<><div style={{padding:'8px 12px',fontSize:11,color:'#888',fontWeight:600,backgroundColor:'#1a1a1a',textTransform:'uppercase',letterSpacing:1}}>Defines ({file.d.length})</div>
+                  {file.d.map((d,i)=><SymbolItem key={d.n+i} name={d.n} kind="define" line={d.l} extra={d.v||undefined} onRefClick={(n)=>setRefSymbol(v=>v===n?null:n)} onCodeClick={(ln)=>setCodeView(v=>v&&v.file===selected&&v.line===ln?null:{file:selected,line:ln})} refCount={(symIndex[d.n]||[]).length}/>)}</>}
+                {file.s.length===0&&file.fn.length===0&&file.d.length===0&&<div style={{padding:24,color:'#555',textAlign:'center'}}>No symbols parsed</div>}
+              </div>}
+              {tab==='includes'&&<div style={{padding:12}}>
+                <div style={{fontSize:11,color:'#666',marginBottom:8}}>Include dependency tree (max depth 4)</div>
+                <IncludeTree file={selected} fileMap={fileMap} onNav={onNav}/>
+                {file.i.length===0&&<div style={{color:'#555',fontSize:13}}>No includes</div>}
+              </div>}
+              {tab==='includedBy'&&<div style={{padding:12}}>
+                <div style={{fontSize:11,color:'#666',marginBottom:8}}>Files that include {file.f}</div>
+                {revIncludes.map(rf=><div key={rf} onClick={()=>onNav(rf)} style={{padding:'4px 8px',cursor:'pointer',fontFamily:"'JetBrains Mono',monospace",fontSize:13,color:'#9cdcfe'}}
+                  onMouseEnter={e=>e.currentTarget.style.textDecoration='underline'} onMouseLeave={e=>e.currentTarget.style.textDecoration='none'}>{rf}</div>)}
+                {revIncludes.length===0&&<div style={{color:'#555',fontSize:13}}>No files include this</div>}
+              </div>}
+            </div>
+          </>:<div style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',color:'#555'}}>Select a file</div>}
+        </div>
+        {refSymbol&&<RefPanel symbol={refSymbol} symIndex={symIndex} onClose={()=>setRefSymbol(null)} onNav={onNav} onCode={setCodeView}/>}
+        {codeView&&<CodePanel file={codeView.file} line={codeView.line} onClose={()=>setCodeView(null)} fileMap={fileMap} rightOffset={refSymbol?320:0}/>}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
